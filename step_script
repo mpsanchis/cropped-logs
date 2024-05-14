@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+start_json="{\"script\": \"$0\"}"
+echo "$start_json"
+runner_script_trap() {
+	exit_code=$?
+	out_json="{\"command_exit_code\": $exit_code, \"script\": \"$0\"}"
+
+	echo ""
+	echo "$out_json"
+	exit 0
+}
+
+# Run the "runner_script_trap" at the end
+trap runner_script_trap EXIT 
+
+# "pipefail" causes a pipeline to return the exit status of the last command to exit with a non-zero status
+if set -o | grep pipefail > /dev/null; then set -o pipefail; fi; 
+
+# causes the shell to exit immediately if any command exits with a non-zero status
+set -o errexit
+
+# allows output redirection operator (>) to be able to redirect output to a file that already exists
+# (normally bash crashes if this is attempted)
+set +o noclobber
+
+if [[ $1 == "java" ]]; then
+	export SPAWNER="java Spawner"
+elif [[ $1 == "js" || $1 == "javascript" ]]; then
+	export SPAWNER="node spawner.js"
+else
+	echo "Only java and js are allowed parameters"
+	exit 1
+fi
+
+: | eval $'$SPAWNER $2'
+
+# always return 0
+exit 0
