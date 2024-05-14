@@ -1,0 +1,5 @@
+# Logging files
+output.log
+print_log.txt
+# Compiled files
+*.class
