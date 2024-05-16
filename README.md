@@ -107,4 +107,4 @@ Or add the unbuffer command in the `eval`uated command in the `step_script`:
 
 Both solutions work. Notes about this approach:
 * `unbuffer` is not available in native MacOS. It was installed through `brew install expect`.
-* General recommended approach is to use Linux's `stdbuf`, such as in [this](asd) stackoverflow question: `stdbuf -i0 -o0 -e0 command`
+* General recommended approach is to use Linux's `stdbuf`, such as in [this](https://stackoverflow.com/a/11337109/4700312) stackoverflow question: `stdbuf -i0 -o0 -e0 command`
