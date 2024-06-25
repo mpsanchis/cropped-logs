@@ -108,3 +108,12 @@ Or add the unbuffer command in the `eval`uated command in the `step_script`:
 Both solutions work. Notes about this approach:
 * `unbuffer` is not available in native MacOS. It was installed through `brew install expect`.
 * General recommended approach is to use Linux's `stdbuf`, such as in [this](https://stackoverflow.com/a/11337109/4700312) stackoverflow question: `stdbuf -i0 -o0 -e0 command`
+
+#### Change the version of Node
+
+Different versions of node behave differently:
+* v10.0.0 - v10.24.1 -> works fine
+* v11.0.0-v11.8.0 -> Segmentation Fault
+* v11.9.0 onwards -> Cropped log
+
+This needs further investigation. A possible cause of the error is [PR 25769](https://github.com/nodejs/node/pull/25769/files), found in the changelog of [v11.9.0](https://github.com/nodejs/node/blob/main/doc/changelogs/CHANGELOG_V11.md#2019-01-30-version-1190-current-targos).
