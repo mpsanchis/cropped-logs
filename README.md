@@ -2,20 +2,28 @@
 
 ## Goal
 
-Understand why GitLab crops some outputs. We don't see the Nx errors because 
+Understand why GitLab crops some outputs. We don't see the Nx errors because logs disappear.
 
-## Commands
 
-### Getting started
+## Getting started
 
-If you want to test Java, compile your Java code with:
+If you want to test Java, compile first your Java code with:
 ```sh
 javac Spawner.java
 ```
 
-### Scripts that fail
+If you want to test C code, compile first your C code with:
+```sh
+gcc ctest.c
+```
 
-#### Parent script
+## Scripts under test (WIP)
+
+Analysing currently a c program that uses pipes internally, to mimic the way Node uses them.
+
+## Scripts that fail
+
+### Parent script
 Running the parent script to print 1000 lines in a node (`js`) process, equivalent to GitLab:
 ```sh
 ./parent_script.sh js 1000
@@ -26,7 +34,7 @@ This cuts while catting line 383, leaving the line half-printed:
 Printing 383 [INFO] Downloading from xyz-platform: https://xyz-platform.maven.pkg.sehlat.io/org/springframewor
 ```
 
-#### Barebones Node + pipe
+### Barebones Node + pipe
 Running the JS program and piping its output to `tee`:
 ```sh
 node spawner.js 1000 | tee output.log
@@ -38,9 +46,9 @@ node spawner.js 1000 | cat
 
 Note that this, as opposed to the `parent_script`, doesn't always print the same number of lines.
 
-### Scripts that work
+## Scripts that work
 
-#### Replacing Node with Java
+### Replacing Node with Java
 Running the "parent script" (emulating GitLab) but spawning processes in Java works:
 ```sh
 ./parent_script.sh java 1000
@@ -52,7 +60,7 @@ java Spawner 1000 | cat
 
 Of course we can't guarantee that both Node and Java do the same thing, but scripts aim to be equivalent.
 
-#### Modifying shell script (child process) to write directly to console instead of catting
+### Modifying shell script (child process) to write directly to console instead of catting
 Modify your `sp1.sh` so that it now reads, from line 5:
 ```bash
 for (( c=1; c<=$1; c++ ))
@@ -69,7 +77,7 @@ Then both:
 
 work OK.
 
-#### Modify your JS code so that it awaits the processes as they are created
+### Modify your JS code so that it awaits the processes as they are created
 
 Make your main code look like:
 ```javascript
@@ -91,7 +99,7 @@ Then verify that both the pipe and the parent script work:
 * `node spawner.js 1000 | cat`
 * `./parent_script.sh js 1000`
 
-#### Running the scripts with "unbuffer"
+### Running the scripts with "unbuffer"
 
 Either run the node command with unbuffer:
 ```js
@@ -109,7 +117,7 @@ Both solutions work. Notes about this approach:
 * `unbuffer` is not available in native MacOS. It was installed through `brew install expect`.
 * General recommended approach is to use Linux's `stdbuf`, such as in [this](https://stackoverflow.com/a/11337109/4700312) stackoverflow question: `stdbuf -i0 -o0 -e0 command`
 
-#### Change the version of Node
+### Change the version of Node
 
 Different versions of node behave differently:
 * v10.0.0 - v10.24.1 -> works fine
