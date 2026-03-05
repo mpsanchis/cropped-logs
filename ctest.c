@@ -46,9 +46,7 @@ int main(void) {
     }
     total_written += n;
     write_count++;
-    if (write_count % 100 == 0) {
-      printf("[DEBUG] Written %zd bytes so far...\n", total_written);
-    }
+    printf("[DEBUG] Written %zd bytes so far...\n", total_written);
   }
 
   // Close both ends of the pipe.
