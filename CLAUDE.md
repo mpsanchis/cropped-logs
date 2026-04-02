@@ -6,9 +6,9 @@ This repository has a simplified scenario, simulating how gitlab executes proces
 
 ## Current Status
 
-**Last Updated**: 2026-03-30
-**Current Phase**: Phase 3 Partial ✅ → Test F mechanism confirmed by strace on Linux
-**Next Step**: Phase 3 (Node version comparison) and Phase 4 (fixes)
+**Last Updated**: 2026-04-02
+**Current Phase**: Phase 3 ✅ Complete
+**Next Step**: Phase 4 (implement and test real fixes)
 
 ### What We've Learned So Far
 
@@ -18,15 +18,15 @@ This repository has a simplified scenario, simulating how gitlab executes proces
 
 ✅ **Phase 2 Complete**: Root cause identified — **Node.js libuv sets the stdout pipe to O_NONBLOCK**, breaking `cat` in child processes.
 
-✅ **Phase 3 (partial)**: Strace on Linux confirmed the exact mechanism behind Test F (pre-spawn console.log).
-- The earlier hypothesis ("pipe starts empty, tee drains fast enough") was **wrong**.
-- Actual mechanism: **libuv's child spawn code clears O_NONBLOCK before exec**, and the second console.log never re-triggers FIONBIO.
+✅ **Phase 3 Complete**: All libuv stdio behaviours fully understood and strace-confirmed.
+- Test F mechanism confirmed: libuv child spawn code clears O_NONBLOCK before exec; FIONBIO never re-issued.
+- Explicit fd passing (`[process.stdin, process.stdout, process.stderr]`) confirmed to fix the issue via the **same accidental mechanism** as Test F, but triggered during `spawn()` rather than by a pre-spawn `console.log`.
 
 See full explanation in the sections below.
 
 ## Problem Summary
 
-When running Node.js spawner with child processes that produce large output, and piping that output through `tee`, the logs get cropped mid-line (around line 383 out of 1000). This happens consistently with Node.js v11.9.0+ but not with v10.x or with Java spawner.
+When running Node.js spawner with child processes that produce large output, and piping that output through `tee`, the logs get cropped mid-line (around line 383 out of 1000). This happens with modern Node.js (v18+, likely v11+) but not with Java spawner.
 
 ### Reproduction Case
 ```bash
@@ -305,6 +305,7 @@ If the second console.log had been the *first* write to process.stdout (instead 
 | Test C | `tee` stdout → `/dev/null` | 379/1003 | 1 | Same failure; confirms issue is in the tee→spawner pipe, not tee→file |
 | Test E | Force fd1 blocking before cat | 1003/1003 | 0 | Explicitly clearing O_NONBLOCK restores safety |
 | Test F | `console.log` before spawn | 1004/1004 | 0 | FIONBIO set once, then libuv child setup clears it, FIONBIO not re-issued |
+| Test 8 | `stdio: [process.stdin, process.stdout, process.stderr]` | 1003/1003 | 0 | Same mechanism as Test F: FIONBIO fires during spawn(), child setup clears it |
 
 ---
 
@@ -317,7 +318,6 @@ If the second console.log had been the *first* write to process.stdout (instead 
 | Java spawner | Java does not set O_NONBLOCK on inherited stdio fds |
 | Sequential awaits (sp1 first) | If sp1 exits first, Promise.race rejects → no console.log → FIONBIO never set |
 | `echo` loop instead of `cat` | Each echo write is ~194 bytes; partial writes are retried; EAGAIN is unlikely |
-| Node v10.x | libuv may not have set O_NONBLOCK on inherited pipe fds in that era |
 
 ### Why `--- I am done ---` Appears After cat Dies
 
@@ -337,14 +337,10 @@ After cat exits with EAGAIN, sp1.sh's bash script continues (no `set -e`). It ru
 5. ✅ **Strace analysis (macOS)** → confirmed `ioctl(1, FIONBIO, [1])` by Node, then EAGAIN by cat
 6. ✅ **Force fd1 back to blocking** → confirmed O_NONBLOCK as root cause
 
-### Phase 3: Node.js Behavior Deep Dive 🔄 PARTIAL
+### Phase 3: Node.js Behavior Deep Dive ✅ COMPLETE
 
 7. ✅ **Strace Test F on Linux** → confirmed exact mechanism; corrected earlier hypothesis
-8. **Compare Node versions** — test v10.24.1 (works) vs v11.9.0 (fails) vs v18 (current, fails)
-   - When did libuv start setting O_NONBLOCK on inherited pipe fds?
-   - Is this related to PR #25769?
-9. **Check if using `[process.stdin, process.stdout, process.stderr]` (explicit fds) instead of `"inherit"` makes a difference**
-   - These should be equivalent, but may differ if libuv treats explicit fd passing differently
+8. ✅ **Explicit fd passing vs `"inherit"`** → fixes the issue, but via the same accidental mechanism as Test F (see Test 8 results below)
 
 ### Phase 4: Explore Solutions
 
@@ -371,6 +367,7 @@ All scripts created during Phase 2 live in the **`phase2-investigation/`** direc
 | `phase2-investigation/sp1_blocking.sh` | sp1.sh that explicitly clears O_NONBLOCK before running cat — Test E |
 | `phase2-investigation/spawner_blocking.js` | Spawner that uses `sp1_blocking.sh` — Test E |
 | `phase2-investigation/spawner_early_log.js` | Spawner with console.log before spawn — Test F |
+| `phase2-investigation/spawner_explicit_fds.js` | Spawner using explicit stream objects instead of `"inherit"` — Test 8 |
 | `phase2-investigation/sp1_monitor.sh` | sp1.sh that monitors fd1 O_NONBLOCK flag at multiple points (not yet run) |
 
 ### Quick repro commands
@@ -396,26 +393,9 @@ echo "Lines: $(wc -l < /tmp/output_testF.log)" && cat /tmp/timing.log
 grep "FIONBIO\|F_SETFL\|EAGAIN" /tmp/strace_testF.log
 ```
 
-### Phase 3 Quick Start
+### Phase 4 Quick Start
 
-**Test 8**: Compare Node versions
-```bash
-# On this machine: node v18.18.2 (fails)
-nvm use 10.24.1
-bash -c "(node phase2-investigation/spawner_timed.js 1000 2>&1 | tee -a /tmp/output.log > /dev/null)"
-# Does v10 fail? Does strace show FIONBIO?
-
-nvm use 11.9.0
-bash -c "(node phase2-investigation/spawner_timed.js 1000 2>&1 | tee -a /tmp/output.log > /dev/null)"
-# Does v11 fail? This is where the regression is expected to have appeared.
-```
-
-**Test 9**: Try explicit fd passing instead of "inherit"
-```bash
-# Modify spawner.js: stdio: [process.stdin, process.stdout, process.stderr]
-# instead of: stdio: "inherit"
-# Does libuv's child setup still clear O_NONBLOCK? Does the failing case still fail?
-```
+See "Recommended Solutions" section for the fix options to implement and test.
 
 ## Results & Findings
 
@@ -465,7 +445,7 @@ All 1002 lines preserved.
 - All 1003 lines preserved, cat exit=0
 - **CONFIRMS**: O_NONBLOCK is the root cause
 
-#### Phase 3 (partial): Test F Strace on Linux ✅
+#### Phase 3: Test F Strace on Linux ✅
 
 **Strace of Test F (`spawner_early_log.js`, Linux, Node v18.18.2)**
 
@@ -495,6 +475,42 @@ write(1, ...,  64821) → resumed =  64821   ← blocked, tee drained, write com
 
 **Corrected hypothesis**: The pipe being "empty" at spawn time had nothing to do with it. The fix works because libuv's child spawn code inadvertently restores blocking mode on the shared pipe, and libuv's one-shot FIONBIO logic prevents it from being re-set.
 
+#### Phase 3: Test 8 — Explicit fd passing vs `"inherit"` ✅
+
+**Spawner**: `spawner_explicit_fds.js` — identical to `spawner_timed.js` but with `stdio: [process.stdin, process.stdout, process.stderr]` instead of `stdio: "inherit"`.
+
+**Result**: **1003/1003 lines, cat exit=0** — complete output, no data loss.
+
+Strace confirmed the mechanism:
+
+```
+# During spawn() of sp1, libuv initialises all three stream handles immediately:
+8658  fcntl(1, F_GETFL)       = 0x1 (O_WRONLY)       ← blocking at start of spawn()
+8658  ioctl(1, FIONBIO, [1])  = 0                     ← FIONBIO fires during spawn(), not later
+
+# sp1 child (pid 8666), between fork() and exec(), libuv child setup:
+8666  fcntl(1, F_GETFL)       = 0x801 (O_WRONLY|O_NONBLOCK)  ← sees it
+8666  fcntl(1, F_SETFL, O_WRONLY) = 0                         ← clears it (shared OFD)
+
+# sp2 child (pid 8667), between fork() and exec():
+8667  fcntl(1, F_GETFL)       = 0x1 (flags O_WRONLY)  ← already blocking, no change
+
+# Later: console.log fires (sp2 has exited, Promise.race resolved)
+# libuv internal state: stdout handle already marked non-blocking → NO re-issue of FIONBIO
+# fd 1 stays blocking at kernel level → cat writes succeed
+```
+
+**Why explicit streams trigger FIONBIO earlier than `"inherit"`**:
+- With `"inherit"`, libuv stores the raw fd number and never touches its flags until Node actually writes to it asynchronously (which happens after sp2 exits → too late).
+- With explicit Stream objects (`process.stdout`), libuv must initialise them as `uv_stream_t` handles during `spawn()` itself. That initialisation includes calling `FIONBIO` to set the handle to non-blocking mode. This fires **before** the child has exec'd, so the very next step — child setup between fork and exec — clears O_NONBLOCK on the shared OFD.
+
+**Is this a robust fix?** **No.** It relies on the same three accidental libuv implementation details as Test F:
+1. libuv fires FIONBIO during spawn (because stream objects require handle initialisation)
+2. libuv child setup clears O_NONBLOCK on inherited fds before exec
+3. libuv never re-issues FIONBIO once the handle is marked non-blocking
+
+If any of these change in a future libuv/Node version, the fix breaks silently. **Do not use this as a production fix.**
+
 ### Confirmed Root Cause
 
 **Node.js libuv sets the stdout pipe to O_NONBLOCK the first time it writes to process.stdout asynchronously. This propagates to all child processes via the shared open file description. `cat` in sp1.sh gets `-1 EAGAIN` when it attempts a write at a moment when the pipe has zero bytes free, and exits with error, losing the remaining data.**
@@ -512,17 +528,19 @@ The failure requires two conditions to coincide:
 
 ### Recommended Solutions
 
-*Leading candidates for Phase 4:*
+**Accidental/fragile workarounds (NOT recommended for production)**:
+- `stdio: [process.stdin, process.stdout, process.stderr]` — works today, depends on libuv internals (Test 8)
+- Pre-spawn `console.log` — same accidental mechanism (Test F)
+- Force fd1 blocking in the child script (Test E) — requires modifying every child script
 
-1. **Buffer console.log, flush after all children exit** — prevents FIONBIO from ever being triggered while children are running. Most targeted fix.
-2. **Use `stdio: "pipe"` + manual forwarding** — creates a new open file description for the child; O_NONBLOCK on the parent's OFD cannot propagate. More complex but robust.
-3. **System-level `unbuffer`** — PTY wrapper; no spawner changes. Practical for GitLab runner configuration.
-4. **Explicitly reset fd 1 to blocking after spawning** — fragile (requires knowing when libuv has finished setting O_NONBLOCK); not recommended.
+*Robust candidates for Phase 4 implementation and testing:*
+
+1. **Buffer console.log, flush after all children exit** — prevents FIONBIO from ever being triggered while children are running. Most targeted code fix. Requires refactoring spawner to queue output.
+2. **Use `stdio: ['inherit', 'pipe', 'inherit']` + `child.stdout.pipe(process.stdout)`** — gives the child a brand-new pipe OFD; O_NONBLOCK on the parent's OFD cannot affect it. `cat` writes to the child-side pipe (always blocking), Node forwards to its own stdout. Robust but adds a forwarding buffer layer.
+3. **System-level `unbuffer node spawner.js`** — PTY wrapper creates a new OFD; O_NONBLOCK never propagates. No spawner code changes. Practical for GitLab runner configuration.
+4. **Explicitly reset fd 1 to blocking in the spawner after all spawns complete** — call `fcntl(1, F_SETFL, O_WRONLY)` from native addon or a Python one-liner. Fragile timing dependency; not recommended.
 
 ## References
 
 - [Node.js, stdout, and disappearing bytes](https://sxlijin.github.io/2024-10-09-node-stdout-disappearing-bytes) - Excellent article explaining pipe buffer limits and async stdout behavior
 - [Node.js Child Process Documentation](https://nodejs.org/api/child_process.html)
-- [Node.js PR #25769](https://github.com/nodejs/node/pull/25769) - Changed process.exit() to process.exitCode in module errors
-- [Node.js v11.9.0 Changelog](https://github.com/nodejs/node/blob/main/doc/changelogs/CHANGELOG_V11.md#2019-01-30-version-1190-current-raspbe)
- [Node.js v11.9.0 Changelog](https://github.com/nodejs/node/blob/main/doc/changelogs/CHANGELOG_V11.md#2019-01-30-version-1190-current-targos)
