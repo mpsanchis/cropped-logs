@@ -1,8 +1,57 @@
+# Note: resume claude session with
+claude --resume 00c8cad1-9dff-4639-884b-dea1969ebc1e
+
 # Investigation: GitLab Cropped Logs Issue
 
 This document tracks our investigation into why GitLab crops output when running Node.js child processes with piped stdout.
 
 This repository has a simplified scenario, simulating how gitlab executes processes in a runner (via a shell script), and how then user code (such as Nx, running in NodeJs) gets executed as a child process.
+
+## Real Scenario
+
+In a Gitlab pipeline, I see the following chain of processes (PIDs change) for any command that I declare in .gitlab-ci.yml:
+```
+    PID    PPID COMMAND
+     24       1 sh -c (/scripts-6039-16459848/detect_shell_script /scripts-6039-16459848/step_script 2>&1 | tee -a /log
+     25      24 /usr/bin/bash /scripts-6039-16459848/step_script
+     30      25 /usr/bin/bash /scripts-6039-16459848/step_script
+     XX      30 nx run-many -t build // <------ or any command I declare in my `.gitlab-ci.yml`
+```
+
+Which uses a `detect_shell_script` that basically does `exec /bin/bash $@`, and a `step_script` that does:
+```
+#!/usr/bin/env bash
+
+trap exit 1 TERM
+
+start_json="{\"script\": \"$0\"}"
+echo "$start_json"
+runner_script_trap() {
+	exit_code=$?
+	out_json="{\"command_exit_code\": $exit_code, \"script\": \"$0\"}"
+
+	echo ""
+	echo "$out_json"
+	exit 0
+}
+
+trap runner_script_trap EXIT
+if set -o | grep pipefail > /dev/null; then set -o pipefail; fi; set -o errexit
+set +o noclobber
+: | eval $'export FF_TEST_FEATURE=false
+export FF_NETWORK_PER_BUILD=false
+// ... other env vars
+mkdir -p "/builds/path/to/repo.tmp"
+touch "/builds/path/to/repo.tmp/gitlab_runner_env"
+while read -r line; do export "$line"; done < "/builds/path/to/repo.tmp/gitlab_runner_env"
+cd /builds/path/to/repo
+// ... here begin my commands from .gitlab-ci.yml
+echo $\'\\x1b[32;1m$ # Load repo-managed environment variables (e.g. release group versions) if present # collapsed multi-line command\\x1b[0;m\'
+// ... other commands I define in .gitlab-ci.yml
+pnpm exec nx affected -t build --configuration=ci
+// ... other commands I define in .gitlab-ci.yml
+'
+```
 
 ## Current Status
 
