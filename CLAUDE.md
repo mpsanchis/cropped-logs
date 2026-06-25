@@ -80,7 +80,7 @@ When running Node.js spawner with child processes that produce large output, and
 ### Reproduction Case
 ```bash
 ./parent_script.sh js 1000
-# Crops at line 383: "Printing 383 [INFO] Downloading from xyz-platform: https://xyz-platform.maven.pkg.sehlat.io/org/springframewor"
+# Crops at line 383: "Printing 383 [INFO] Downloading from xyz-platform: https://xyz-platform.maven.pkg.example.io/org/springframewor"
 ```
 
 ## Code Structure Analysis
@@ -567,6 +567,55 @@ The failure requires two conditions to coincide:
 2. **Use `stdio: "pipe"` + manual forwarding** — creates a new open file description for the child; O_NONBLOCK on the parent's OFD cannot propagate. More complex but robust.
 3. **System-level `unbuffer`** — PTY wrapper; no spawner changes. Practical for GitLab runner configuration.
 4. **Explicitly reset fd 1 to blocking after spawning** — fragile (requires knowing when libuv has finished setting O_NONBLOCK); not recommended.
+
+#### Phase 4: NODE_OPTIONS preload experiment ✅
+
+**Hypothesis**: Calling `process.stdout._handle.setBlocking(true)` (and the same for stderr) at every Node process startup forces libuv to use blocking writes for stdio. libuv then never issues `ioctl(FIONBIO, [1])`, so the shared open file description never picks up `O_NONBLOCK`. Children inheriting the pipe (cat, JVMs, etc.) see a blocking pipe and never hit `EAGAIN`.
+
+`setBlocking()` is a private but stable Node.js API that maps directly to libuv's public `uv_stream_set_blocking()`. The preload is injected via `NODE_OPTIONS=--require=/path/to/preload.cjs`, which propagates to every child Node process automatically.
+
+**Preload script** (`/tmp/setblocking.cjs`):
+```js
+try {
+  process.stdout?._handle?.setBlocking?.(true);
+  process.stderr?._handle?.setBlocking?.(true);
+} catch {}
+```
+
+**Test 1 — baseline (no preload), Node v24.17.0:**
+```
+$ bash parent_script.sh js 1000
+$ wc -l output.log
+341 output.log
+```
+Cropped as expected — cat hit `EAGAIN`, sp1 exited 1.
+
+**Test 2 — with preload, same scenario:**
+```
+$ NODE_OPTIONS="--require=/tmp/setblocking.cjs" bash parent_script.sh js 1000
+$ wc -l output.log
+1006 output.log
+```
+Full output preserved — same passing behaviour as Scenario 3 (`sp1_blocking.sh` clearing O_NONBLOCK manually).
+
+**Test 3 — stdout/stderr separation preserved** (this is the key advantage over the `unbuffer` workaround, which uses a PTY and collapses both streams):
+```js
+// stderr_test.js
+process.stderr.write("npm warn ...\n");
+process.stdout.write("https://registry.example.io\n");
+```
+```
+$ NODE_OPTIONS="--require=/tmp/setblocking.cjs" node stderr_test.js 2>stderr.out >stdout.out
+$ cat stdout.out
+https://registry.example.io
+$ cat stderr.out
+npm warn ...
+```
+Streams remain separate — any caller that parses stdout independently of stderr (e.g. `@nx/js:release-publish`'s `execAsync('npm config get …')`) continues to work.
+
+**Why it works**: `uv_stream_set_blocking(true)` clears `O_NONBLOCK` on the underlying fd at the kernel level *and* updates libuv's internal handle state so it never re-issues `FIONBIO`. Equivalent to Scenario 3's manual fcntl, but applied automatically at every Node startup before any user code runs.
+
+**Status**: validated locally against the cropped-logs repro on Node v24.17.0. Recommended for downstream adoption (e.g. GitLab CI shims that currently wrap node with `unbuffer`).
 
 ## References
 
