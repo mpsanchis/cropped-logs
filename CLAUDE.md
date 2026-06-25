@@ -354,6 +354,7 @@ If the second console.log had been the *first* write to process.stdout (instead 
 | Test C | `tee` stdout → `/dev/null` | 379/1003 | 1 | Same failure; confirms issue is in the tee→spawner pipe, not tee→file |
 | Test E | Force fd1 blocking before cat | 1003/1003 | 0 | Explicitly clearing O_NONBLOCK restores safety |
 | Test F | `console.log` before spawn | 1004/1004 | 0 | FIONBIO set once, then libuv child setup clears it, FIONBIO not re-issued |
+| Test G | `script` wrapper (PTY allocation) | 1006/1006 | 0 | Forces PTY, Node sees TTY and doesn't set O_NONBLOCK |
 
 ---
 
@@ -616,6 +617,20 @@ Streams remain separate — any caller that parses stdout independently of stder
 **Why it works**: `uv_stream_set_blocking(true)` clears `O_NONBLOCK` on the underlying fd at the kernel level *and* updates libuv's internal handle state so it never re-issues `FIONBIO`. Equivalent to Scenario 3's manual fcntl, but applied automatically at every Node startup before any user code runs.
 
 **Status**: validated locally against the cropped-logs repro on Node v24.17.0. Recommended for downstream adoption (e.g. GitLab CI shims that currently wrap node with `unbuffer`).
+
+#### Phase 4: script utility experiment ✅
+
+**Hypothesis**: Wrapping the process execution block in the `script` command (forcing PTY allocation) convinces Node.js that stdout is a terminal/TTY. Consequently, libuv does not apply `O_NONBLOCK` on stdout, and child processes write in blocking mode, avoiding log cropping.
+
+**Test**: Modified `step_script` to wrap execution with `script -q /dev/null` on macOS:
+```bash
+script -q /dev/null node spawner.js 1000
+```
+
+**Results**: 
+- All **1006 lines** were successfully preserved (no cropping).
+- Unlike `unbuffer` applied globally, wrapping only the entrypoint command inside `script` did not affect child processes spawned programmatically via raw pipes (e.g., `nx`'s calls to `npm config`), so internal communication remained intact.
+- *Caveat (macOS vs Linux):* On Linux (`util-linux`), `script` exits with `0` unless the `-e` / `--return` flag is passed (e.g., `script -q -e -c "..." /dev/null`).
 
 ## References
 
