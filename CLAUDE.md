@@ -109,10 +109,21 @@ When running Node.js spawner with child processes that produce large output, and
 
 The critical problem: **O_NONBLOCK is a property of the open file description** (kernel-level object), not of the file descriptor. All processes that share the same underlying pipe — including Node's child processes spawned with `stdio: "inherit"` — share this flag.
 
-With a non-blocking pipe:
-- `write(fd, buf, n)` on a fully full pipe returns `-1 EAGAIN` instead of blocking
-- `cat` (both GNU and BSD) does NOT handle EAGAIN — it treats it as a write error and exits with code 1
-- Data that `cat` was in the middle of writing is lost
+This kernel behavior manifests as two distinct failure modes depending on how stdio is configured for child processes:
+
+#### Failure Mode 1: Direct EAGAIN Crash (Inherited stdio)
+When a child process (like `cat` or `mvn`) is spawned using `stdio: "inherit"`, it writes directly to the shared stdout pipe.
+- The parent Node process sets `O_NONBLOCK` on the pipe.
+- The child process inherits the stdout FD pointing to the same non-blocking OFD.
+- When the child writes to the pipe and the pipe fills up, the write returns `-1 EAGAIN`.
+- Standard UNIX utilities (like `cat`) do not handle `EAGAIN` and immediately crash (e.g., exiting with code 1, "write error"), leading to cropped logs.
+
+#### Failure Mode 2: Asynchronous Buffer Discard at Exit (Piped stdio)
+When a child process is spawned using `stdio: "pipe"`, the child's stdout is a separate, private, blocking pipe. 
+- The child process writes to its blocking pipe and exits successfully (exit code 0).
+- The Node parent (or worker) reads from the child's pipe and forwards it to its own stdout using `process.stdout.write()`.
+- Because Node's stdout pipe has `O_NONBLOCK` set, libuv queues these writes asynchronously.
+- If the parent process calls `process.exit()` immediately when the child exits (bypassing the stream's `drain` event), Node terminates and discards all pending asynchronous writes in libuv's queue. The tail end of the forwarded logs is lost, even though the child tool completed successfully.
 
 **Evidence from strace (Linux, failing scenario)**:
 ```
