@@ -650,3 +650,6 @@ script -q /dev/null node spawner.js 1000
 - [Node.js PR #25769](https://github.com/nodejs/node/pull/25769) - Changed process.exit() to process.exitCode in module errors
 - [Node.js v11.9.0 Changelog](https://github.com/nodejs/node/blob/main/doc/changelogs/CHANGELOG_V11.md#2019-01-30-version-1190-current-raspbe)
  [Node.js v11.9.0 Changelog](https://github.com/nodejs/node/blob/main/doc/changelogs/CHANGELOG_V11.md#2019-01-30-version-1190-current-targos)
+- [StackOverflow - Turn off stdout buffering in a pipe](https://unix.stackexchange.com/questions/25372/how-to-turn-off-stdout-buffering-in-a-pipe/25378#25378)
+
+
