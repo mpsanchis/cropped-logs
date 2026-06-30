@@ -55,9 +55,9 @@ pnpm exec nx affected -t build --configuration=ci
 
 ## Current Status
 
-**Last Updated**: 2026-03-30
-**Current Phase**: Phase 3 Partial ✅ → Test F mechanism confirmed by strace on Linux
-**Next Step**: Phase 3 (Node version comparison) and Phase 4 (fixes)
+**Last Updated**: 2026-06-30
+**Current Phase**: Phase 5 Complete ✅ → Preload fix validated in real-world CI (external Maven/Nx repo)
+**Next Step**: Ship preload via CI base image; clean up per-repo CI workarounds
 
 ### What We've Learned So Far
 
@@ -70,6 +70,10 @@ pnpm exec nx affected -t build --configuration=ci
 ✅ **Phase 3 (partial)**: Strace on Linux confirmed the exact mechanism behind Test F (pre-spawn console.log).
 - The earlier hypothesis ("pipe starts empty, tee drains fast enough") was **wrong**.
 - Actual mechanism: **libuv's child spawn code clears O_NONBLOCK before exec**, and the second console.log never re-triggers FIONBIO.
+
+✅ **Phase 4 Complete**: Two fixes validated locally — NODE_OPTIONS preload (`setBlocking(true)`) and `script -qec` PTY wrapping.
+
+✅ **Phase 5 Complete**: NODE_OPTIONS preload validated in real-world CI on an external Maven/Nx repo (consistently cropping). Cropping eliminated with preload active.
 
 See full explanation in the sections below.
 
@@ -558,11 +562,14 @@ write(1, ...,  64821) → resumed =  64821   ← blocked, tee drained, write com
 
 ### Confirmed Root Cause
 
-**Node.js libuv sets the stdout pipe to O_NONBLOCK the first time it writes to process.stdout asynchronously. This propagates to all child processes via the shared open file description. `cat` in sp1.sh gets `-1 EAGAIN` when it attempts a write at a moment when the pipe has zero bytes free, and exits with error, losing the remaining data.**
+**Node.js libuv sets the stdout pipe to O_NONBLOCK the first time it writes to process.stdout asynchronously.** This single fact is the root cause. The precise way data is then lost depends on how child processes are configured (see Failure Mode 1 and 2 in the Root Cause section above):
 
-The failure requires two conditions to coincide:
-1. **O_NONBLOCK is set** — triggered by Node writing to stdout from an async callback while children are running, AND no subsequent child spawn resets it before cat runs
-2. **cat attempts a write when the pipe is completely full (0 bytes free)** — which happens because the echo loop has already partially filled the pipe before cat starts
+- **Mode 1 (stdio: "inherit")**: The child process (e.g. `cat`, JVM) directly shares the non-blocking OFD, gets `-1 EAGAIN` when the pipe is full, and exits with a write error, losing the tail of its output.
+- **Mode 2 (stdio: "pipe")**: The child writes successfully to its own blocking pipe. The Node parent reads those bytes and forwards them via `process.stdout.write()` to its own `O_NONBLOCK` pipe. libuv queues those writes asynchronously. When the parent calls `process.exit()` — triggered by the child's exit or a build failure — the libuv write queue is discarded. The tail of the forwarded output is lost, even though the child exited cleanly.
+
+Mode 1 is demonstrated by the `spawner.js` / `cat` reproduction in this repo. Mode 2 is the operative mechanism in real Nx builds (where workers use `stdio: ['inherit', 'pipe', 'pipe', 'ipc']`): the Nx orchestrator reads from N worker pipes and forwards to its own `O_NONBLOCK` stdout without backpressure (`process.stdout.write()` return value is never checked); on a failed build, `process.exit(1)` is called while the write queue is non-empty.
+
+**Open question**: which mode is active in any given cropping event has not been confirmed by strace on a real Nx CI run. Mode 2 is the working hypothesis for the Nx chain based on code analysis.
 
 ### Rejected Hypotheses
 
@@ -573,12 +580,16 @@ The failure requires two conditions to coincide:
 
 ### Recommended Solutions
 
-*Leading candidates for Phase 4:*
+*Status after Phase 4–5 experiments:*
 
-1. **Buffer console.log, flush after all children exit** — prevents FIONBIO from ever being triggered while children are running. Most targeted fix.
-2. **Use `stdio: "pipe"` + manual forwarding** — creates a new open file description for the child; O_NONBLOCK on the parent's OFD cannot propagate. More complex but robust.
-3. **System-level `unbuffer`** — PTY wrapper; no spawner changes. Practical for GitLab runner configuration.
-4. **Explicitly reset fd 1 to blocking after spawning** — fragile (requires knowing when libuv has finished setting O_NONBLOCK); not recommended.
+| Solution | Mode 1 | Mode 2 | Notes |
+|---|---|---|---|
+| `NODE_OPTIONS=--require=setblocking.cjs` preload | ✅ | ✅ | **Chosen fix.** Covers both modes. stdout/stderr stay separate. |
+| `script -qec "<cmd>" /dev/null` PTY wrap | ✅ | ✅ | Also works; see caveat below. Per-command wrapping needed; tools see isTTY=true. |
+| `unbuffer node` shim | ✅ | ✅ | Discarded — collapses stdout+stderr, broke npm registry parsing. |
+| Buffer console.log, flush after children exit | ✅ | ❌ | Only prevents FIONBIO during spawns; doesn't fix the exit-discard path. |
+| `stdio: "pipe"` + manual forwarding | ✅ | ❌ | Only breaks Mode 1's OFD sharing; the forwarder itself is still Mode 2 vulnerable. |
+| Explicitly reset fd 1 to blocking after spawning | ✅ | ❌ | Fragile, timing-dependent. |
 
 #### Phase 4: NODE_OPTIONS preload experiment ✅
 
@@ -625,9 +636,11 @@ npm warn ...
 ```
 Streams remain separate — any caller that parses stdout independently of stderr (e.g. `@nx/js:release-publish`'s `execAsync('npm config get …')`) continues to work.
 
-**Why it works**: `uv_stream_set_blocking(true)` clears `O_NONBLOCK` on the underlying fd at the kernel level *and* updates libuv's internal handle state so it never re-issues `FIONBIO`. Equivalent to Scenario 3's manual fcntl, but applied automatically at every Node startup before any user code runs.
+**Why it works (Mode 1)**: `uv_stream_set_blocking(true)` clears `O_NONBLOCK` on the underlying fd at the kernel level *and* updates libuv's internal handle state so it never re-issues `FIONBIO`. Children inheriting the pipe (cat, JVMs, etc.) see a blocking fd and never hit EAGAIN.
 
-**Status**: validated locally against the cropped-logs repro on Node v24.17.0. Recommended for downstream adoption (e.g. GitLab CI shims that currently wrap node with `unbuffer`).
+**Why it works (Mode 2)**: With blocking mode active, every `process.stdout.write(chunk)` in the forwarding loop becomes a synchronous blocking call — libuv bypasses its async write queue entirely and calls `write()` inline. There is nothing left in the queue when `process.exit()` fires. Nothing can be abandoned at exit.
+
+**Status**: validated locally against the cropped-logs repro on Node v24.17.0 (341 → 1006 lines), and in real-world CI on an external Maven/Nx repo (consistently cropping Maven builds stopped cropping with preload active).
 
 #### Phase 4: script utility experiment ✅
 
@@ -642,6 +655,24 @@ script -q /dev/null node spawner.js 1000
 - All **1006 lines** were successfully preserved (no cropping).
 - Unlike `unbuffer` applied globally, wrapping only the entrypoint command inside `script` did not affect child processes spawned programmatically via raw pipes (e.g., `nx`'s calls to `npm config`), so internal communication remained intact.
 - *Caveat (macOS vs Linux):* On Linux (`util-linux`), `script` exits with `0` unless the `-e` / `--return` flag is passed (e.g., `script -q -e -c "..." /dev/null`).
+
+**Why it works (Mode 1)**: Node sees `process.stdout.isTTY === true` (PTY slave). libuv uses its `uv_tty_t` path, which does not set `O_NONBLOCK` on the fd. Downstream children inheriting the PTY fd never encounter a non-blocking write.
+
+**Why it works (Mode 2)**: libuv's TTY write path does not use the same async queue as the pipe write path (`uv_pipe_t`). The PTY driver applies backpressure by blocking the writer. `process.stdout.write()` calls are effectively synchronous; nothing is pending in a queue at `process.exit()` time, so nothing is lost.
+
+**Caveat (per-command wrapping)**: Unlike the NODE_OPTIONS preload (a one-time `before_script` setup), `script` must wrap each individual command in the `script:` block to protect it. Any unwrapped command is still vulnerable. Also, all tools inside the `script` session see `isTTY=true`, which can enable colours, progress bars, or Nx's TUI in CI logs.
+
+#### Phase 5: Real-world CI validation ✅
+
+**Repo**: an external Spring Boot / Maven project built with Nx, running in a GitLab CI pipeline. Cropping occurred consistently on CI (confirmed across multiple pipelines prior to this experiment).
+
+**Baseline** (no preload, no shim): Maven build logs consistently cropped. Exact crop point varied by run but was reproducible.
+
+**With NODE_OPTIONS preload** (same block as documented in Phase 4, added to `.base.before_script`): Full Maven build output preserved. Cropping did not occur. No regressions observed in other pipeline steps.
+
+**With `script -qec` PTY wrapping** (tested separately on same repo): Also eliminated cropping. Confirmed the PTY-based path as an independent fix.
+
+**Conclusion**: Both fixes work in a real failing-builds scenario. The NODE_OPTIONS preload is the chosen solution for CI base images because it requires no per-command changes and does not affect `isTTY` detection.
 
 ## References
 
